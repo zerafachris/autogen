@@ -328,3 +328,117 @@ async def test_multimodal_message_response(agent: OpenAIAgent, cancellation_toke
     assert response.chat_message is not None
     assert isinstance(response.chat_message, TextMessage)
     assert "cat" in response.chat_message.content.lower()
+
+
+def test_mcp_tool_defaults_require_approval_to_always(
+    mock_openai_client: AsyncOpenAI, caplog: pytest.LogCaptureFixture
+) -> None:
+    mcp_tool: dict[str, Any] = {
+        "type": "mcp",
+        "server_label": "my-mcp",
+        "server_url": "https://mcp.example.com",
+    }
+    with caplog.at_level("WARNING"):
+        mcp_agent = OpenAIAgent(
+            name="mcp_assistant",
+            description="MCP assistant",
+            client=mock_openai_client,
+            model="gpt-4.1",
+            instructions="Use MCP safely.",
+            tools=[mcp_tool],  # type: ignore[arg-type]
+        )
+
+    assert mcp_agent.tools == [
+        {
+            "type": "mcp",
+            "server_label": "my-mcp",
+            "server_url": "https://mcp.example.com",
+            "require_approval": "always",
+        }
+    ]
+    assert "require_approval" not in mcp_tool
+    assert any("Defaulting require_approval to 'always'" in rec.message for rec in caplog.records)
+
+
+def test_mcp_tool_preserves_explicit_require_approval(
+    mock_openai_client: AsyncOpenAI, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING"):
+        mcp_agent = OpenAIAgent(
+            name="mcp_assistant",
+            description="MCP assistant",
+            client=mock_openai_client,
+            model="gpt-4.1",
+            instructions="Use MCP.",
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "my-mcp",
+                    "server_url": "https://mcp.example.com",
+                    "require_approval": "never",
+                }
+            ],
+        )
+
+    assert mcp_agent.tools[0]["require_approval"] == "never"
+    assert not any("Defaulting require_approval to 'always'" in rec.message for rec in caplog.records)
+
+
+def test_local_shell_dict_validates_model_and_logs_warning(
+    mock_openai_client: AsyncOpenAI, caplog: pytest.LogCaptureFixture
+) -> None:
+    with pytest.raises(ValueError, match="only supported with model 'codex-mini-latest'"):
+        OpenAIAgent(
+            name="shell_assistant",
+            description="Shell assistant",
+            client=mock_openai_client,
+            model="gpt-4.1",
+            instructions="Run shell.",
+            tools=[{"type": "local_shell"}],
+        )
+
+    with caplog.at_level("WARNING"):
+        shell_agent = OpenAIAgent(
+            name="shell_assistant",
+            description="Shell assistant",
+            client=mock_openai_client,
+            model="codex-mini-latest",
+            instructions="Run shell.",
+            tools=[{"type": "local_shell"}],
+        )
+    assert shell_agent.tools == [{"type": "local_shell"}]
+    assert any("local_shell" in rec.message for rec in caplog.records)
+
+
+def test_configured_builtin_tool_validates_required_params_and_logs_computer_use_warning(
+    mock_openai_client: AsyncOpenAI, caplog: pytest.LogCaptureFixture
+) -> None:
+    with pytest.raises(ValueError, match="missing required parameter"):
+        OpenAIAgent(
+            name="bad_mcp",
+            description="Bad MCP",
+            client=mock_openai_client,
+            model="gpt-4.1",
+            instructions="Test",
+            tools=[{"type": "mcp", "server_label": "only-label"}],  # type: ignore[list-item]
+        )
+
+    with caplog.at_level("WARNING"):
+        cu_agent = OpenAIAgent(
+            name="cu_assistant",
+            description="Computer use assistant",
+            client=mock_openai_client,
+            model="computer-use-preview",
+            instructions="Use computer.",
+            tools=[
+                {
+                    "type": "computer_use_preview",
+                    "display_height": 768,
+                    "display_width": 1024,
+                    "environment": "browser",
+                }
+            ],
+        )
+    assert cu_agent.tools[0]["type"] == "computer_use_preview"
+    assert any("computer_use_preview" in rec.message for rec in caplog.records)
+

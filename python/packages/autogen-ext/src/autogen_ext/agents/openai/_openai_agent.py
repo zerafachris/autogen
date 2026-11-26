@@ -73,14 +73,19 @@ class ComputerUseToolConfig(TypedDict):
 
 
 class MCPToolConfig(TypedDict):
-    """Configuration for mcp tool."""
+    """Configuration for mcp tool.
+
+    If ``require_approval`` is omitted, :class:`OpenAIAgent` defaults it to
+    ``"always"`` so remote MCP tools cannot execute without approval unless the
+    caller explicitly opts out.
+    """
 
     type: Literal["mcp"]
     server_label: str  # required - Label for the MCP server
     server_url: str  # required - URL of the MCP server
     allowed_tools: NotRequired[List[str]]  # optional - List of allowed tools
     headers: NotRequired[Dict[str, str]]  # optional - HTTP headers for requests
-    require_approval: NotRequired[bool]  # optional - Whether to require user approval
+    require_approval: NotRequired[Union[bool, Literal["always", "never"], Dict[str, Any]]]  # optional - Approval policy
 
 
 class CodeInterpreterToolConfig(TypedDict):
@@ -280,9 +285,14 @@ class OpenAIAgent(BaseChatAgent, Component[OpenAIAgentConfig]):
             - file_search: max_num_results (int), ranking_options (dict), filters (dict)
             - web_search_preview: user_location (str or dict), search_context_size (int)
             - image_generation: background (str), input_image_mask (str)
-            - mcp: allowed_tools (List[str]), headers (dict), require_approval (bool)
-            Special tools with model restrictions:
-            - local_shell: Only works with "codex-mini-latest" model (WARNING: Very limited support)
+            - mcp: allowed_tools (List[str]), headers (dict), require_approval (bool | "always" | "never" | dict).
+              Defaults to ``"always"`` when omitted so remote MCP tools require approval unless explicitly opted out.
+            Approval and execution semantics for dangerous built-in tools:
+            - mcp: ``require_approval`` defaults to ``"always"`` when omitted (and logs a warning).
+            - local_shell: Only works with "codex-mini-latest" model (WARNING: Very limited support; the Responses API
+              provides no library-level ``require_approval`` field for ``local_shell``).
+            - computer_use_preview: Requires ``display_height``, ``display_width``, and ``environment`` (WARNING: the
+              Responses API provides no library-level ``require_approval`` field for ``computer_use_preview``).
             Custom tools are not supported.
         temperature (Optional[float]): Temperature for response generation (default: 1)
         max_output_tokens (Optional[int]): Maximum output tokens
@@ -428,9 +438,64 @@ class OpenAIAgent(BaseChatAgent, Component[OpenAIAgentConfig]):
                     self._add_builtin_tool(tool)
                 elif isinstance(tool, dict) and "type" in tool:
                     # Handle configured built-in tools
-                    self._tools.append(cast(dict[str, Any], tool))
+                    self._add_configured_builtin_tool(cast(dict[str, Any], tool))
                 else:
                     raise ValueError(f"Unsupported tool type: {type(tool)}")
+
+    def _add_configured_builtin_tool(self, tool_config: Dict[str, Any]) -> None:
+        """Validate and register a dict-configured built-in tool with fail-closed approval defaults."""
+        tool_type = tool_config.get("type")
+        if not isinstance(tool_type, str):
+            raise ValueError(f"Unsupported built-in tool type: {tool_type}")
+
+        required_fields: Dict[str, List[str]] = {
+            "file_search": ["vector_store_ids"],
+            "code_interpreter": ["container"],
+            "computer_use_preview": ["display_height", "display_width", "environment"],
+            "mcp": ["server_label", "server_url"],
+            "web_search_preview": [],
+            "image_generation": [],
+            "local_shell": [],
+        }
+        if tool_type not in required_fields:
+            raise ValueError(f"Unsupported built-in tool type: {tool_type}")
+
+        missing = [field for field in required_fields[tool_type] if field not in tool_config]
+        if missing:
+            raise ValueError(
+                f"Tool '{tool_type}' is missing required parameter(s): {', '.join(missing)}. "
+                f"Required parameters for {tool_type}: {self._get_required_params_help(tool_type)}"
+            )
+
+        normalized = dict(tool_config)
+        if tool_type == "mcp":
+            if "require_approval" not in normalized or normalized["require_approval"] is None:
+                normalized["require_approval"] = "always"
+                event_logger.warning(
+                    "MCP tool '%s' did not specify 'require_approval'. "
+                    "Defaulting require_approval to 'always' so remote MCP tool calls require explicit approval.",
+                    normalized.get("server_label", "<unnamed>"),
+                )
+        elif tool_type == "local_shell":
+            if self._model != "codex-mini-latest":
+                raise ValueError(
+                    f"Tool 'local_shell' is only supported with model 'codex-mini-latest', "
+                    f"but current model is '{self._model}'. "
+                    f"This tool is available exclusively through the Responses API and has severe limitations. "
+                    f"Consider using autogen_ext.tools.code_execution.PythonCodeExecutionTool with "
+                    f"autogen_ext.code_executors.local.LocalCommandLineCodeExecutor for shell execution instead."
+                )
+            event_logger.warning(
+                "Built-in tool 'local_shell' is enabled without an in-library approval gate; "
+                "approval semantics are delegated to the Responses API."
+            )
+        elif tool_type == "computer_use_preview":
+            event_logger.warning(
+                "Built-in tool 'computer_use_preview' is enabled without an in-library approval gate; "
+                "approval semantics are delegated to the Responses API."
+            )
+
+        self._tools.append(normalized)
 
     def _add_builtin_tool(self, tool_name: str) -> None:
         """Add a built-in tool by name."""
@@ -443,16 +508,7 @@ class OpenAIAgent(BaseChatAgent, Component[OpenAIAgentConfig]):
         elif tool_name == "image_generation":
             self._tools.append({"type": "image_generation"})
         elif tool_name == "local_shell":
-            # Special handling for local_shell - very limited model support
-            if self._model != "codex-mini-latest":
-                raise ValueError(
-                    f"Tool 'local_shell' is only supported with model 'codex-mini-latest', "
-                    f"but current model is '{self._model}'. "
-                    f"This tool is available exclusively through the Responses API and has severe limitations. "
-                    f"Consider using autogen_ext.tools.code_execution.PythonCodeExecutionTool with "
-                    f"autogen_ext.code_executors.local.LocalCommandLineCodeExecutor for shell execution instead."
-                )
-            self._tools.append({"type": "local_shell"})
+            self._add_configured_builtin_tool({"type": "local_shell"})
         elif tool_name in ["file_search", "code_interpreter", "computer_use_preview", "mcp"]:
             # These tools require specific parameters and must use dict configuration
             raise ValueError(
